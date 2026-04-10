@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Landscape Installation</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script>
+// ---------------------------------------------------------------------------
+// State — updated by WebSocket, read by draw()
+// ---------------------------------------------------------------------------
+let currentScene = "forest";
+let targetScene  = "forest";
+let transitionAmt = 1.0;   // 0 = fully previous scene, 1 = fully current scene
+let gestureFlash  = 0;     // brief highlight when a gesture fires
+
+const SCENES = ["forest", "ocean", "desert", "tundra", "jungle"];
+
+// ---------------------------------------------------------------------------
+// WebSocket — connects to Django Channels
+// ---------------------------------------------------------------------------
+const WS_URL = "ws://localhost:8000/ws/installation/";
+let ws;
+
+function connectWebSocket() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => console.log("WebSocket connected");
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === "scene") {
+      if (msg.scene !== currentScene) {
+        targetScene   = msg.scene;
+        transitionAmt = 0;       // start crossfade
+      }
+    }
+
+    if (msg.type === "gesture") {
+      gestureFlash = 1.0;        // flash indicator
+      console.log("Gesture:", msg.event);
+    }
+  };
+
+  ws.onclose = () => {
+    console.log("WebSocket closed — retrying in 2s");
+    setTimeout(connectWebSocket, 2000);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// p5.js sketch
+// ---------------------------------------------------------------------------
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  colorMode(RGB, 255);
+  noStroke();
+  connectWebSocket();
+}
+
+function draw() {
+  // Advance crossfade
+  transitionAmt = min(1.0, transitionAmt + 0.02);
+  if (transitionAmt >= 1.0) currentScene = targetScene;
+
+  // Draw current scene (or blend during transition)
+  drawScene(currentScene);
+
+  // Gesture flash overlay
+  if (gestureFlash > 0) {
+    fill(255, 255, 255, gestureFlash * 40);
+    rect(0, 0, width, height);
+    gestureFlash = max(0, gestureFlash - 0.05);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scene renderer — add your own landscapes here
+// ---------------------------------------------------------------------------
+function drawScene(scene) {
+  switch (scene) {
+    case "forest":  drawForest();  break;
+    case "ocean":   drawOcean();   break;
+    case "desert":  drawDesert();  break;
+    case "tundra":  drawTundra();  break;
+    case "jungle":  drawJungle();  break;
+    default:        drawForest();
+  }
+}
+
+// --- Forest ---
+function drawForest() {
+  // Sky — deep blue to lighter at horizon
+  for (let y = 0; y < height * 0.6; y++) {
+    let inter = map(y, 0, height * 0.6, 0, 1);
+    fill(lerpColor(color(10, 20, 60), color(60, 100, 140), inter));
+    rect(0, y, width, 1);
+  }
+  // Ground
+  fill(20, 50, 20);
+  rect(0, height * 0.6, width, height);
+  // Rolling hills (noise-based)
+  fill(34, 85, 34);
+  beginShape();
+  for (let x = 0; x <= width; x += 4) {
+    let n = noise(x * 0.003, frameCount * 0.005);
+    let y = height * 0.55 + map(n, 0, 1, -60, 60);
+    vertex(x, y);
+  }
+  vertex(width, height);
+  vertex(0, height);
+  endShape(CLOSE);
+  // Trees
+  for (let i = 0; i < 12; i++) {
+    drawTree(width * (i / 11), height * 0.58 - i % 3 * 10);
+  }
+}
+
+function drawTree(x, groundY) {
+  // Trunk
+  fill(60, 40, 20);
+  rect(x - 4, groundY, 8, 30);
+  // Canopy layers
+  fill(30, 100, 30);
+  triangle(x, groundY - 80, x - 30, groundY + 10, x + 30, groundY + 10);
+  fill(40, 120, 40);
+  triangle(x, groundY - 110, x - 22, groundY - 30, x + 22, groundY - 30);
+  fill(50, 140, 50);
+  triangle(x, groundY - 135, x - 15, groundY - 65, x + 15, groundY - 65);
+}
+
+// --- Ocean ---
+function drawOcean() {
+  // Sky
+  background(20, 40, 100);
+  // Animated waves using noise
+  for (let layer = 3; layer >= 0; layer--) {
+    let baseY = height * (0.45 + layer * 0.12);
+    let col = lerpColor(color(20, 60, 160), color(10, 120, 180), layer / 3);
+    fill(col);
+    beginShape();
+    for (let x = 0; x <= width; x += 4) {
+      let n = noise(x * 0.005 + layer, frameCount * 0.008 + layer * 10);
+      let y = baseY + map(n, 0, 1, -25, 25);
+      vertex(x, y);
+    }
+    vertex(width, height);
+    vertex(0, height);
+    endShape(CLOSE);
+  }
+  // Horizon shimmer
+  fill(255, 255, 255, 15);
+  rect(0, height * 0.44, width, 3);
+}
+
+// --- Desert ---
+function drawDesert() {
+  // Warm sky
+  for (let y = 0; y < height * 0.6; y++) {
+    let inter = map(y, 0, height * 0.6, 0, 1);
+    fill(lerpColor(color(200, 100, 30), color(240, 180, 80), inter));
+    rect(0, y, width, 1);
+  }
+  // Sand dunes
+  for (let d = 2; d >= 0; d--) {
+    let baseY = height * (0.55 + d * 0.1);
+    fill(lerpColor(color(210, 160, 80), color(180, 130, 50), d / 2));
+    beginShape();
+    for (let x = 0; x <= width; x += 4) {
+      let n = noise(x * 0.004 + d * 50, d);
+      let y = baseY + map(n, 0, 1, -50, 50);
+      vertex(x, y);
+    }
+    vertex(width, height);
+    vertex(0, height);
+    endShape(CLOSE);
+  }
+}
+
+// --- Tundra ---
+function drawTundra() {
+  // Cold pale sky
+  background(180, 200, 220);
+  // Snow ground
+  fill(230, 235, 245);
+  beginShape();
+  for (let x = 0; x <= width; x += 4) {
+    let n = noise(x * 0.004, frameCount * 0.002);
+    let y = height * 0.65 + map(n, 0, 1, -20, 20);
+    vertex(x, y);
+  }
+  vertex(width, height);
+  vertex(0, height);
+  endShape(CLOSE);
+  // Falling snow particles
+  fill(255, 255, 255, 180);
+  noStroke();
+  for (let i = 0; i < 80; i++) {
+    let x = (noise(i * 10, frameCount * 0.01) * width * 1.2) % width;
+    let y = (noise(i * 10 + 500, frameCount * 0.015) * height * 1.2) % height;
+    ellipse(x, y, 3, 3);
+  }
+}
+
+// --- Jungle ---
+function drawJungle() {
+  // Lush dark green sky canopy
+  background(10, 40, 15);
+  // Dense layered foliage
+  for (let layer = 0; layer < 5; layer++) {
+    let g = map(layer, 0, 4, 60, 160);
+    fill(10, g, 20, 200);
+    beginShape();
+    for (let x = 0; x <= width; x += 3) {
+      let n = noise(x * 0.006 + layer * 30, frameCount * 0.004 + layer);
+      let y = height * (0.3 + layer * 0.12) + map(n, 0, 1, -40, 40);
+      vertex(x, y);
+    }
+    vertex(width, height);
+    vertex(0, height);
+    endShape(CLOSE);
+  }
+  // Light shafts
+  for (let i = 0; i < 5; i++) {
+    let x = width * (i / 4);
+    let alpha = 15 + sin(frameCount * 0.02 + i) * 8;
+    fill(200, 240, 180, alpha);
+    beginShape();
+    vertex(x - 20, 0);
+    vertex(x + 20, 0);
+    vertex(x + 80, height);
+    vertex(x - 80, height);
+    endShape(CLOSE);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resize handler
+// ---------------------------------------------------------------------------
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+</script>
+</body>
+</html>
