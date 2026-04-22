@@ -10,12 +10,17 @@ MODEL_PATH = 'hand_landmarker.task'
 NUM_HANDS = 2
 MOTION_HISTORY = 15       # frames to track for motion detection
 MOTION_THRESHOLD = 0.05   # normalized coordinate distance to register a swipe
-PINCH_THRESHOLD = 0.06    # normalized distance for pinch detection
-
 # Landmark indices
 WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
+INDEX_PIP = 6
+MIDDLE_TIP = 12
+MIDDLE_PIP = 10
+RING_TIP = 16
+RING_PIP = 14
+PINKY_TIP = 20
+PINKY_PIP = 18
 
 
 def build_detector() -> vision.HandLandmarker:
@@ -41,12 +46,18 @@ def detect_motion(history: deque) -> str:
     return 'Swipe Down' if dy > 0 else 'Swipe Up'
 
 
-def is_pinching(landmarks) -> bool:
-    """Return True when thumb tip and index tip are close together."""
-    thumb = landmarks[THUMB_TIP]
-    index = landmarks[INDEX_TIP]
-    dist = np.hypot(thumb.x - index.x, thumb.y - index.y)
-    return dist < PINCH_THRESHOLD
+def is_open(landmarks) -> bool:
+    """Return True when all four fingers are extended."""
+    def extended(tip, pip):
+        return landmarks[tip].y < landmarks[pip].y
+
+    return (
+        extended(INDEX_TIP, INDEX_PIP)
+        and extended(MIDDLE_TIP, MIDDLE_PIP)
+        and extended(RING_TIP, RING_PIP)
+        and extended(PINKY_TIP, PINKY_PIP)
+    )
+
 
 def draw_label(frame: np.ndarray, text: str, pos: tuple, color=(0, 255, 0)) -> None:
     cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
@@ -67,7 +78,7 @@ def main() -> None:
             if not ret:
                 break
 
-            # frame = cv2.flip(frame, 1)  # mirror for natural interaction
+            frame = cv2.flip(frame, 1)  # mirror for natural interaction
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
@@ -79,23 +90,14 @@ def main() -> None:
                 histories[i].append((wrist.x, wrist.y))
 
                 motion = detect_motion(histories[i])
-                pinch = is_pinching(hand_landmarks)
+                open_hand = is_open(hand_landmarks)
 
-                label = motion or ('Pinch' if pinch else '')
-                if label:
-                    detected_gestures.append(label)
+                label = motion or ('Open' if open_hand else 'Closed')
+                detected_gestures.append(label)
 
             # Clear histories for hands no longer detected
             for i in range(len(result.hand_landmarks), NUM_HANDS):
                 histories[i].clear()
-
-            # Annotate handedness
-            for i, handedness in enumerate(result.handedness):
-                side = handedness[0].display_name
-                h, w = frame.shape[:2]
-                wrist = result.hand_landmarks[i][WRIST]
-                x, y = int(wrist.x * w), int(wrist.y * h) - 20
-                draw_label(frame, side, (x, y), color=(255, 200, 0))
 
             if detected_gestures:
                 draw_label(frame, ' | '.join(detected_gestures), (10, 50))
