@@ -2,42 +2,84 @@
 opencv_detector.py
 
 Run this script independently alongside Django.
-It reads from the camera, detects motion/position,
-and sends gesture events to the Django Channels layer.
+It reads from the camera, detects hand gestures,
+and sends scene events to the Django Channels layer.
+
+A closed fist held in one of the four screen quadrants triggers the
+scene assigned to that quadrant.
 
 Usage:
     python opencv_detector.py
 
 Requirements:
-    pip install opencv-python channels-redis
+    pip install opencv-python mediapipe channels-redis
 """
 
 import asyncio
 import cv2
+import mediapipe as mp
 import numpy as np
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 from channels.layers import get_channel_layer
 
 
 CHANNEL_GROUP = "installation"
-CAMERA_INDEX = 0          # 0 = default webcam, change for external camera
+CAMERA_INDEX = 0 # This is the default camera
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 
-# Zones: divide frame into thirds horizontally
-ZONE_LEFT = 1 / 3
-ZONE_RIGHT = 2 / 3
+MODEL_PATH = 'hand_landmarker.task'
+NUM_HANDS = 1
+
+# Landmark indices
+WRIST = 0
+INDEX_TIP = 8
+INDEX_PIP = 6
+MIDDLE_TIP = 12
+MIDDLE_PIP = 10
+RING_TIP = 16
+RING_PIP = 14
+PINKY_TIP = 20
+PINKY_PIP = 18
+
+# Quadrant → scene mapping (top-left, top-right, bottom-left, bottom-right)
+QUADRANT_SCENES = {
+    "top_left":     "forest",
+    "top_right":    "ocean",
+    "bottom_left":  "desert",
+    "bottom_right": "tundra",
+}
 
 
-async def send_gesture(channel_layer, gesture: str, data: dict = {}):
-    """Send a gesture event to all connected WebSocket clients."""
-    await channel_layer.group_send(
-        CHANNEL_GROUP,
-        {
-            "type": "gesture_event",   # maps to consumer method name
-            "gesture": gesture,
-            "data": data,
-        }
+def build_detector() -> vision.HandLandmarker:
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_hands=NUM_HANDS,
     )
+    return vision.HandLandmarker.create_from_options(options)
+
+
+def is_closed_fist(landmarks) -> bool:
+    """Return True when all four fingers are curled (closed fist)."""
+    def curled(tip, pip):
+        return landmarks[tip].y > landmarks[pip].y
+
+    return (
+        curled(INDEX_TIP, INDEX_PIP)
+        and curled(MIDDLE_TIP, MIDDLE_PIP)
+        and curled(RING_TIP, RING_PIP)
+        and curled(PINKY_TIP, PINKY_PIP)
+    )
+
+
+def get_quadrant(x: float, y: float) -> str:
+    """Return quadrant name for normalized (x, y) wrist coordinates."""
+    v = "top" if y < 0.5 else "bottom"
+    h = "left" if x < 0.5 else "right"
+    return f"{v}_{h}"
 
 
 async def send_scene(channel_layer, scene: str):
@@ -53,95 +95,82 @@ async def send_scene(channel_layer, scene: str):
 
 async def run_detector():
     channel_layer = get_channel_layer()
+    detector = build_detector()
+
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    # Background subtractor — learns what the empty wall looks like
-    bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-        history=500,
-        varThreshold=50,
-        detectShadows=False,
-    )
-
-    last_zone = None
-    scenes = ["forest", "ocean", "desert", "tundra", "jungle"]
-    scene_index = 0
+    last_fist_quadrant = None
 
     print("OpenCV detector running. Press Q in the debug window to quit.")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera read failed — check CAMERA_INDEX")
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Camera read failed — check CAMERA_INDEX")
+                break
 
-        frame = cv2.flip(frame, 1)  # mirror so movement feels natural
-        h, w = frame.shape[:2]
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
 
-        # --- Foreground mask ---
-        fg_mask = bg_subtractor.apply(frame)
-        fg_mask = cv2.morphologyEx(
-            fg_mask, cv2.MORPH_OPEN,
-            np.ones((5, 5), np.uint8)
-        )
+            # Draw quadrant dividers
+            cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 0, 0), 1)
+            cv2.line(frame, (0, h // 2), (w, h // 2), (255, 0, 0), 1)
 
-        # --- Find contours (people) ---
-        contours, _ = cv2.findContours(
-            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+            # Label each quadrant with its scene name
+            quadrant_labels = [
+                ("forest",  (10,          30)),
+                ("ocean",   (w // 2 + 10, 30)),
+                ("desert",  (10,          h // 2 + 30)),
+                ("tundra",  (w // 2 + 10, h // 2 + 30)),
+            ]
+            for text, pos in quadrant_labels:
+                cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (200, 200, 200), 1, cv2.LINE_AA)
 
-        large_contours = [c for c in contours if cv2.contourArea(c) > 5000]
+            # Run hand detection
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = detector.detect(mp_image)
 
-        if large_contours:
-            # Use the largest contour as the primary person
-            person = max(large_contours, key=cv2.contourArea)
-            x, y, cw, ch = cv2.boundingRect(person)
-            centre_x = x + cw / 2
+            fist_quadrant = None
 
-            # Determine horizontal zone
-            rel_x = centre_x / w
-            if rel_x < ZONE_LEFT:
-                zone = "left"
-            elif rel_x > ZONE_RIGHT:
-                zone = "right"
-            else:
-                zone = "centre"
+            for hand_landmarks in result.hand_landmarks:
+                wrist = hand_landmarks[WRIST]
+                quadrant = get_quadrant(wrist.x, wrist.y)
 
-            # Fire gesture event only when zone changes
-            if zone != last_zone:
-                print(f"Zone changed: {zone}")
-                await send_gesture(channel_layer, f"move_{zone}", {"x": rel_x})
+                px, py = int(wrist.x * w), int(wrist.y * h)
+                cv2.circle(frame, (px, py), 8, (0, 255, 0), -1)
 
-                # Change scene when moving to left or right edge
-                if zone == "left":
-                    scene_index = (scene_index - 1) % len(scenes)
-                    await send_scene(channel_layer, scenes[scene_index])
-                elif zone == "right":
-                    scene_index = (scene_index + 1) % len(scenes)
-                    await send_scene(channel_layer, scenes[scene_index])
+                if is_closed_fist(hand_landmarks):
+                    fist_quadrant = quadrant
+                    cv2.putText(frame, f"FIST: {quadrant}", (px + 12, py),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.putText(frame, quadrant, (px + 12, py),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-                last_zone = zone
+            # Trigger scene change when a fist appears in a new quadrant
+            if fist_quadrant and fist_quadrant != last_fist_quadrant:
+                scene = QUADRANT_SCENES[fist_quadrant]
+                print(f"Fist in {fist_quadrant} → scene: {scene}")
+                await send_scene(channel_layer, scene)
+                last_fist_quadrant = fist_quadrant
+            elif not fist_quadrant:
+                last_fist_quadrant = None  # reset so the same quadrant can fire again
 
-            # Debug: draw bounding box and zone on frame
-            cv2.rectangle(frame, (x, y), (x + cw, y + ch), (0, 255, 0), 2)
-            cv2.putText(frame, zone, (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.imshow("OpenCV debug — camera feed", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-        # Zone dividers for debug view
-        cv2.line(frame, (int(w * ZONE_LEFT), 0), (int(w * ZONE_LEFT), h), (255, 0, 0), 1)
-        cv2.line(frame, (int(w * ZONE_RIGHT), 0), (int(w * ZONE_RIGHT), h), (255, 0, 0), 1)
+            await asyncio.sleep(0)
 
-        cv2.imshow("OpenCV debug — camera feed", frame)
-        cv2.imshow("Foreground mask", fg_mask)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
-
-        await asyncio.sleep(0)  # yield to event loop
-
-    cap.release()
-    cv2.destroyAllWindows()
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        detector.close()
 
 
 if __name__ == "__main__":
